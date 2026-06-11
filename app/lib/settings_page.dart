@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'update_check.dart';
 import 'vpn_config.dart';
 
 /// Hidden owner-only screen to view / import / export / switch VPN profiles.
@@ -47,6 +49,41 @@ class _SettingsPageState extends State<SettingsPage> {
         }),
     ]);
     if (mounted) setState(() => _checking = false);
+  }
+
+  Future<void> _checkUpdate() async {
+    _toast('Проверяю обновления…');
+    try {
+      final info = await checkForUpdate();
+      if (!mounted) return;
+      if (info == null) {
+        _toast('У вас последняя версия ($kAppVersion)');
+        return;
+      }
+      final go = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: Text('Доступна версия ${info.version}'),
+          content: Text(info.notes.isEmpty
+              ? 'Скачать и установить обновление?'
+              : info.notes),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('Позже')),
+            FilledButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('Скачать')),
+          ],
+        ),
+      );
+      if (go == true && info.url.isNotEmpty) {
+        await launchUrl(Uri.parse(info.url),
+            mode: LaunchMode.externalApplication);
+      }
+    } catch (_) {
+      _toast('Не удалось проверить обновления');
+    }
   }
 
   void _toast(String m) {
@@ -146,8 +183,13 @@ class _SettingsPageState extends State<SettingsPage> {
     }
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Профили VPN'),
+        title: const Text('Профили VPN · v$kAppVersion'),
         actions: [
+          IconButton(
+            tooltip: 'Проверить обновления',
+            onPressed: _checkUpdate,
+            icon: const Icon(Icons.system_update),
+          ),
           IconButton(
             tooltip: 'Проверить все',
             onPressed: _checking ? null : _checkAll,
