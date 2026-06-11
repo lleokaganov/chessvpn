@@ -120,7 +120,9 @@ String buildSingboxConfig(String vlessUrl, {String? caCertPath}) {
   final sni = q['sni'] ?? q['peer'] ?? host;
   final fp = q['fp'] ?? 'chrome';
   final flow = q['flow'] ?? '';
-  final tlsOn = (q['security'] ?? 'tls') != 'none';
+  final security = q['security'] ?? 'tls';
+  final tlsOn = security != 'none';
+  final realityOn = security == 'reality';
 
   final outbound = <String, dynamic>{
     'type': 'vless',
@@ -134,17 +136,27 @@ String buildSingboxConfig(String vlessUrl, {String? caCertPath}) {
     final tls = <String, dynamic>{
       'enabled': true,
       'server_name': sni,
+      // uTLS is mandatory for REALITY and good camouflage for plain TLS too.
       'utls': {'enabled': true, 'fingerprint': fp},
     };
-    // Verify against our bundled root store (assets/cacert.pem), passed in by the
-    // desktop caller. Covers every public CA (Let's Encrypt, Google Trust Services,
-    // …) so it works with any of the servers, independent of the device's OS store.
-    if (caCertPath != null && caCertPath.isNotEmpty) {
+    if (realityOn) {
+      // REALITY: the handshake borrows a real external site's certificate, so there
+      // is NO server cert of ours to verify — trust is the x25519 public key (pbk)
+      // + short id (sid) from the share link, not any CA. Hides the SNI from DPI.
+      tls['reality'] = {
+        'enabled': true,
+        'public_key': q['pbk'] ?? '',
+        'short_id': q['sid'] ?? '',
+      };
+    } else if (caCertPath != null && caCertPath.isNotEmpty) {
+      // Plain TLS: verify against our bundled root store (assets/cacert.pem) so it
+      // works with any public CA, independent of the device's OS trust store.
       tls['certificate_path'] = caCertPath;
     }
     outbound['tls'] = tls;
   }
-  if (type == 'ws') {
+  // REALITY runs over raw TCP with xtls-rprx-vision flow — never a ws transport.
+  if (type == 'ws' && !realityOn) {
     outbound['transport'] = {
       'type': 'ws',
       'path': path,
