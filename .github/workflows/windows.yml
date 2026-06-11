@@ -1,0 +1,61 @@
+name: build-windows
+
+# Builds the Windows desktop app (chess.exe) on a Microsoft-hosted Windows runner.
+# No local Windows machine needed: Visual Studio C++ toolchain is preinstalled here.
+# The finished build is uploaded as the "chess-windows" artifact (a zip).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.1'
+          channel: stable
+          cache: true
+
+      - name: Flutter version
+        run: flutter --version
+
+      - name: Generate Windows runner & build
+        working-directory: app
+        shell: pwsh
+        run: |
+          flutter config --enable-windows-desktop
+          flutter create --platforms=windows .
+          # Brand the window title "Chess" instead of the project name.
+          (Get-Content windows\runner\main.cpp) -replace 'twomove','Chess' | Set-Content windows\runner\main.cpp
+          flutter pub get
+          flutter build windows --release
+
+      - name: Bundle sing-box core + wintun driver
+        working-directory: app
+        shell: pwsh
+        run: |
+          $dst = "build\windows\x64\runner\Release"
+          # Rename the runner exe to chess.exe (brand). Flutter finds data\ relative to it.
+          if (Test-Path "$dst\twomove.exe") { Rename-Item "$dst\twomove.exe" "chess.exe" }
+          Copy-Item "..\desktop\sing-box.exe" "$dst\sing-box.exe"
+          Invoke-WebRequest "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile wintun.zip
+          Expand-Archive wintun.zip -DestinationPath wintun -Force
+          Copy-Item "wintun\wintun\bin\amd64\wintun.dll" "$dst\wintun.dll"
+          Write-Host "--- Release folder ---"
+          Get-ChildItem $dst | Select-Object Name, Length
+
+      - name: Package zip
+        working-directory: app
+        shell: pwsh
+        run: Compress-Archive -Path build\windows\x64\runner\Release\* -DestinationPath ..\chess-windows.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chess-windows
+          path: chess-windows.zip
+          retention-days: 30

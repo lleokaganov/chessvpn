@@ -1,0 +1,36 @@
+# Only the Flutter app source, the Windows core binary and the CI workflow are tracked.
+# Everything heavy / generated is ignored.
+
+# sing-box source tree and reference checkouts (huge, not needed to build the app)
+/sing-box/
+/sfa-ref/
+/build/
+/singbox-client.json
+/desktop/sing-box
+/desktop/socks-test.json
+/desktop/chessvpn-helper
+
+# Android tree is excluded from THIS repo: not needed for the Windows/Linux desktop
+# build, it carries the home-server config (a secret) and a 39 MB libbox.aar.
+app/android/
+
+# Stale desktop core binaries committed as assets earlier (not referenced by pubspec).
+app/assets/bin/
+
+# Flutter generated / build output
+app/build/
+app/.dart_tool/
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/.idea/
+app/android/.gradle/
+app/android/build/
+app/android/app/build/
+app/android/.kotlin/
+app/android/local.properties
+app/linux/flutter/ephemeral/
+app/windows/flutter/ephemeral/
+app/ios/
+app/macos/
+app/web/
+**/*.iml.bak
