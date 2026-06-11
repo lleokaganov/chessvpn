@@ -70,6 +70,7 @@ flutter:
 
   assets:
     - assets/chess/
+    - assets/cacert.pem
 
   fonts:
     - family: ChessFont
