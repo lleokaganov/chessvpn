@@ -3,8 +3,8 @@ import 'dart:io';
 
 /// App version. Bump [kAppBuild] on every release; the update check compares this
 /// integer against the `build` field in the remote manifest.
-const kAppBuild = 2;
-const kAppVersion = '1.1.0';
+const kAppBuild = 3;
+const kAppVersion = '1.2.0';
 
 /// Update manifest, hosted on a Russia-reachable mirror (no secrets in it). Shape:
 /// {"build":N,"version":"x.y.z","notes":"…","android":"<apk url>","windows":"<zip url>"}
