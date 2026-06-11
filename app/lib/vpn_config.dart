@@ -23,6 +23,18 @@ class VpnProfile {
       return url;
     }
   }
+
+  /// Connection kind for the UI badge: "Reality", "VLESS-TLS", or "VLESS".
+  String get kind {
+    try {
+      final sec = Uri.parse(url).queryParameters['security'] ?? 'tls';
+      if (sec == 'reality') return 'Reality';
+      if (sec == 'none') return 'VLESS';
+      return 'VLESS-TLS';
+    } catch (_) {
+      return 'VLESS';
+    }
+  }
 }
 
 class VpnStore {
@@ -79,6 +91,10 @@ class VpnStore {
     return buildSingboxConfig(list[i].url, caCertPath: caPath);
   }
 
+  /// Public access to the bundled CA path (desktop only) — for the health-check probe.
+  static Future<String?> caBundlePath() async =>
+      (Platform.isAndroid || Platform.isIOS) ? null : await _ensureCaBundle();
+
   /// Materialise the bundled CA roots (assets/cacert.pem) to a temp file so sing-box
   /// can reference it by path. Returns null on failure (falls back to the OS store).
   static Future<String?> _ensureCaBundle() async {
@@ -96,10 +112,9 @@ class VpnStore {
   }
 }
 
-/// Turn a `vless://uuid@host:port?...#name` URL into a full sing-box client config
-/// (tun inbound + vless outbound + DNS that resolves the server directly to avoid
-/// the bootstrap loop). Throws [FormatException] on a malformed URL.
-String buildSingboxConfig(String vlessUrl, {String? caCertPath}) {
+/// Build just the vless/reality outbound (tag "proxy") from a `vless://` share URL.
+/// Shared by the full tunnel config and the health-check probe. Throws on a bad URL.
+Map<String, dynamic> _vlessOutbound(String vlessUrl, {String? caCertPath}) {
   final u = Uri.parse(vlessUrl.trim());
   if (u.scheme != 'vless') {
     throw const FormatException('Not a vless:// URL');
@@ -140,17 +155,15 @@ String buildSingboxConfig(String vlessUrl, {String? caCertPath}) {
       'utls': {'enabled': true, 'fingerprint': fp},
     };
     if (realityOn) {
-      // REALITY: the handshake borrows a real external site's certificate, so there
-      // is NO server cert of ours to verify — trust is the x25519 public key (pbk)
-      // + short id (sid) from the share link, not any CA. Hides the SNI from DPI.
+      // REALITY borrows a real external site's handshake — trust is the x25519 key
+      // (pbk) + short id (sid), not any CA; the SNI is hidden from DPI.
       tls['reality'] = {
         'enabled': true,
         'public_key': q['pbk'] ?? '',
         'short_id': q['sid'] ?? '',
       };
     } else if (caCertPath != null && caCertPath.isNotEmpty) {
-      // Plain TLS: verify against our bundled root store (assets/cacert.pem) so it
-      // works with any public CA, independent of the device's OS trust store.
+      // Plain TLS: verify against our bundled root store, independent of the OS store.
       tls['certificate_path'] = caCertPath;
     }
     outbound['tls'] = tls;
@@ -163,6 +176,14 @@ String buildSingboxConfig(String vlessUrl, {String? caCertPath}) {
       'headers': {'Host': wsHost},
     };
   }
+  return outbound;
+}
+
+/// Turn a `vless://` URL into a full sing-box client config (tun in + the outbound +
+/// DNS that resolves the server directly to dodge the bootstrap loop).
+String buildSingboxConfig(String vlessUrl, {String? caCertPath}) {
+  final outbound = _vlessOutbound(vlessUrl, caCertPath: caCertPath);
+  final host = outbound['server'] as String;
 
   final cfg = {
     'log': {'level': 'info', 'timestamp': true},
@@ -216,9 +237,10 @@ class ProbeResult {
   ProbeResult(this.ok, this.ms, this.err);
 }
 
-/// Quick health check: open a TLS (or TCP) connection to the profile's server
-/// from the current network. Proves the server is up & reachable (and the TLS
-/// cert is valid) without bringing the whole tunnel up. Best-effort, 6s timeout.
+/// SHALLOW check (mobile fallback): just opens a TLS/TCP connection to the server's
+/// port. NOTE: this only proves the port is reachable — it is fooled by REALITY
+/// camouflage and by a Cloudflare edge whose origin tunnel is dead (both complete a
+/// TLS handshake while carrying no working tunnel). Prefer [probeViaCore] on desktop.
 Future<ProbeResult> probeProfile(VpnProfile p) async {
   final sw = Stopwatch()..start();
   try {
@@ -238,5 +260,96 @@ Future<ProbeResult> probeProfile(VpnProfile p) async {
     return ProbeResult(true, sw.elapsedMilliseconds, null);
   } catch (e) {
     return ProbeResult(false, sw.elapsedMilliseconds, e.toString());
+  }
+}
+
+/// A minimal sing-box config exposing the profile's outbound via a local HTTP proxy on
+/// [httpPort] — used to push real traffic through the tunnel during a health check.
+String buildProbeConfig(String vlessUrl, int httpPort, {String? caCertPath}) {
+  final outbound = _vlessOutbound(vlessUrl, caCertPath: caCertPath);
+  final host = outbound['server'] as String;
+  final cfg = {
+    'log': {'level': 'error'},
+    'dns': {
+      'servers': [
+        {'tag': 'd', 'address': '8.8.8.8', 'detour': 'direct'},
+        {'tag': 'p', 'address': '1.1.1.1', 'detour': 'proxy'},
+      ],
+      'rules': [
+        {'domain': [host], 'server': 'd'},
+      ],
+      'final': 'p',
+      'strategy': 'ipv4_only',
+    },
+    'inbounds': [
+      {'type': 'http', 'tag': 'in', 'listen': '127.0.0.1', 'listen_port': httpPort},
+    ],
+    'outbounds': [
+      outbound,
+      {'type': 'direct', 'tag': 'direct'},
+      {'type': 'dns', 'tag': 'dns-out'},
+    ],
+    'route': {
+      'rules': [
+        {'protocol': 'dns', 'outbound': 'dns-out'},
+      ],
+      'final': 'proxy',
+    },
+  };
+  return const JsonEncoder.withIndent('  ').convert(cfg);
+}
+
+/// Locate the sing-box core for desktop health-checks, or null if not found.
+String? desktopCorePath() {
+  if (Platform.isLinux) {
+    for (final c in ['/usr/local/lib/chessvpn/sing-box', '/usr/local/bin/sing-box']) {
+      if (File(c).existsSync()) return c;
+    }
+  } else if (Platform.isWindows) {
+    final p = '${File(Platform.resolvedExecutable).parent.path}\\sing-box.exe';
+    if (File(p).existsSync()) return p;
+  } else if (Platform.isMacOS) {
+    final p = '${File(Platform.resolvedExecutable).parent.path}/sing-box';
+    if (File(p).existsSync()) return p;
+  }
+  return null;
+}
+
+/// TRUTHFUL health check (desktop): spin up the core with the profile's outbound behind
+/// a local HTTP proxy and actually fetch a 204 endpoint THROUGH the tunnel. Can't be
+/// fooled by REALITY camouflage or a dead-origin Cloudflare edge. [corePath] = sing-box.
+Future<ProbeResult> probeViaCore(VpnProfile p, String corePath,
+    {String? caCertPath, int port = 11900}) async {
+  final sw = Stopwatch()..start();
+  Process? proc;
+  final cfgFile = File(
+      '${Directory.systemTemp.path}${Platform.pathSeparator}chessvpn-probe-$port.json');
+  try {
+    await cfgFile.writeAsString(buildProbeConfig(p.url, port, caCertPath: caCertPath));
+    proc = await Process.start(corePath, ['run', '-c', cfgFile.path]);
+    // give the http inbound a moment to come up
+    await Future.delayed(const Duration(milliseconds: 1300));
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 8)
+      ..findProxy = (_) => 'PROXY 127.0.0.1:$port';
+    try {
+      final req = await client
+          .getUrl(Uri.parse('http://www.gstatic.com/generate_204'))
+          .timeout(const Duration(seconds: 9));
+      final resp = await req.close().timeout(const Duration(seconds: 9));
+      await resp.drain<void>();
+      final ok = resp.statusCode == 204 || resp.statusCode == 200;
+      return ProbeResult(
+          ok, sw.elapsedMilliseconds, ok ? null : 'HTTP ${resp.statusCode}');
+    } finally {
+      client.close(force: true);
+    }
+  } catch (e) {
+    return ProbeResult(false, sw.elapsedMilliseconds, e.toString());
+  } finally {
+    proc?.kill();
+    try {
+      if (cfgFile.existsSync()) cfgFile.deleteSync();
+    } catch (_) {}
   }
 }

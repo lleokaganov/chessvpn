@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -42,9 +43,16 @@ class _SettingsPageState extends State<SettingsPage> {
       _checking = true;
       _probe.clear();
     });
+    // On desktop, run a TRUTHFUL check: push real traffic through each tunnel via the
+    // core. On mobile (no spawnable core here), fall back to the shallow port probe.
+    final core = (Platform.isAndroid || Platform.isIOS) ? null : desktopCorePath();
+    final caPath = (core != null) ? await VpnStore.caBundlePath() : null;
     await Future.wait([
       for (var i = 0; i < _profiles.length; i++)
-        probeProfile(_profiles[i]).then((r) {
+        (core != null
+                ? probeViaCore(_profiles[i], core, caCertPath: caPath, port: 11900 + i)
+                : probeProfile(_profiles[i]))
+            .then((r) {
           if (mounted) setState(() => _probe[i] = r);
         }),
     ]);
@@ -241,12 +249,33 @@ class _SettingsPageState extends State<SettingsPage> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Text(p.summary),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 6, vertical: 1),
+                        margin: const EdgeInsets.only(right: 6),
+                        decoration: BoxDecoration(
+                          color: p.kind == 'Reality'
+                              ? const Color(0xFF2E7D32)
+                              : const Color(0xFF607D8B),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(p.kind,
+                            style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600)),
+                      ),
+                      Flexible(child: Text(p.summary)),
+                    ],
+                  ),
                   if (_probe[i] != null)
                     Text(
                       _probe[i]!.ok
-                          ? '✓ доступен · ${_probe[i]!.ms} мс'
-                          : '✗ не отвечает',
+                          ? '✓ туннель работает · ${_probe[i]!.ms} мс'
+                          : '✗ туннель не работает',
                       style: TextStyle(
                         color: _probe[i]!.ok
                             ? const Color(0xFF2E7D32)
