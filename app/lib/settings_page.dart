@@ -59,6 +59,66 @@ class _SettingsPageState extends State<SettingsPage> {
     if (mounted) setState(() => _checking = false);
   }
 
+  Future<void> _routeDialog() async {
+    var mode = await VpnStore.routeMode();
+    final ctrl = TextEditingController(text: await VpnStore.routeList());
+    if (!mounted) return;
+    await showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) => AlertDialog(
+          title: const Text('Маршрутизация'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                for (final m in const [
+                  ['all', 'Весь трафик через VPN'],
+                  ['include', 'Только список → через VPN'],
+                  ['exclude', 'Всё через VPN, кроме списка'],
+                ])
+                  RadioListTile<String>(
+                    value: m[0],
+                    groupValue: mode,
+                    onChanged: (v) => setLocal(() => mode = v!),
+                    title: Text(m[1]),
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: ctrl,
+                  maxLines: 7,
+                  minLines: 3,
+                  style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+                  decoration: const InputDecoration(
+                    border: OutlineInputBorder(),
+                    hintText: '# по строке: IP, маска или домен\n'
+                        '10.0.0.0/24\n192.168.1.5\nyoutube.com\ngooglevideo.com',
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Отмена')),
+            FilledButton(
+              onPressed: () async {
+                await VpnStore.saveRoute(mode, ctrl.text);
+                if (ctx.mounted) Navigator.pop(ctx);
+                _toast('Маршрутизация сохранена (применится при следующем включении)');
+              },
+              child: const Text('Сохранить'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Future<void> _checkUpdate() async {
     _toast('Проверяю обновления…');
     try {
@@ -193,6 +253,11 @@ class _SettingsPageState extends State<SettingsPage> {
       appBar: AppBar(
         title: const Text('Профили VPN · v$kAppVersion'),
         actions: [
+          IconButton(
+            tooltip: 'Маршрутизация',
+            onPressed: _routeDialog,
+            icon: const Icon(Icons.alt_route),
+          ),
           IconButton(
             tooltip: 'Проверить обновления',
             onPressed: _checkUpdate,

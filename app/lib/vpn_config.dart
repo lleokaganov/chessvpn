@@ -75,6 +75,21 @@ class VpnStore {
     await _storage.write(key: _kActive, value: '$clamped');
   }
 
+  // Split-tunnel routing (global): 'all' = everything via VPN (default); 'include' =
+  // only the listed IPs/CIDRs/domains via VPN, rest direct; 'exclude' = everything via
+  // VPN except the listed ones. The list is newline-separated CIDRs/domains.
+  static const _kRouteMode = 'routeMode';
+  static const _kRouteList = 'routeList';
+
+  static Future<String> routeMode() async =>
+      (await _storage.read(key: _kRouteMode)) ?? 'all';
+  static Future<String> routeList() async =>
+      (await _storage.read(key: _kRouteList)) ?? '';
+  static Future<void> saveRoute(String mode, String list) async {
+    await _storage.write(key: _kRouteMode, value: mode);
+    await _storage.write(key: _kRouteList, value: list);
+  }
+
   /// The sing-box JSON for the currently active profile (what the core runs).
   static Future<String> activeConfig() async {
     final list = await load();
@@ -88,7 +103,10 @@ class VpnStore {
     // networks. Android/iOS use the platform store via the native tunnel, which is fine.
     final caPath =
         (Platform.isAndroid || Platform.isIOS) ? null : await _ensureCaBundle();
-    return buildSingboxConfig(list[i].url, caCertPath: caPath);
+    return buildSingboxConfig(list[i].url,
+        caCertPath: caPath,
+        routeMode: await routeMode(),
+        routeList: await routeList());
   }
 
   /// Public access to the bundled CA path (desktop only) — for the health-check probe.
@@ -179,11 +197,62 @@ Map<String, dynamic> _vlessOutbound(String vlessUrl, {String? caCertPath}) {
   return outbound;
 }
 
+/// Split a routing list (one entry per line, `#` comments) into IP/CIDR vs domain
+/// matchers. A bare IPv4 gets `/32`.
+({List<String> cidrs, List<String> domains}) _splitRouteList(String list) {
+  final cidrs = <String>[];
+  final domains = <String>[];
+  for (final raw in list.split('\n')) {
+    final e = raw.trim();
+    if (e.isEmpty || e.startsWith('#')) continue;
+    if (RegExp(r'^\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?$').hasMatch(e)) {
+      cidrs.add(e.contains('/') ? e : '$e/32');
+    } else {
+      domains.add(e);
+    }
+  }
+  return (cidrs: cidrs, domains: domains);
+}
+
 /// Turn a `vless://` URL into a full sing-box client config (tun in + the outbound +
-/// DNS that resolves the server directly to dodge the bootstrap loop).
-String buildSingboxConfig(String vlessUrl, {String? caCertPath}) {
+/// DNS + split-tunnel routing). [routeMode]: 'all' (everything via VPN, default),
+/// 'include' (only [routeList] entries via VPN, rest direct), or 'exclude' (all via
+/// VPN except [routeList]). [routeList] = newline-separated CIDRs/domains.
+String buildSingboxConfig(String vlessUrl,
+    {String? caCertPath, String routeMode = 'all', String routeList = ''}) {
   final outbound = _vlessOutbound(vlessUrl, caCertPath: caCertPath);
   final host = outbound['server'] as String;
+
+  final parsed = _splitRouteList(routeList);
+  // DNS always stays in front; cidr & domain get SEPARATE rules (single-rule fields
+  // are AND-ed in sing-box, so two rules = OR).
+  final routeRules = <Map<String, dynamic>>[
+    {'protocol': 'dns', 'outbound': 'dns-out'},
+  ];
+  String routeFinal;
+  String dnsFinal;
+  if (routeMode == 'include') {
+    if (parsed.cidrs.isNotEmpty) {
+      routeRules.add({'ip_cidr': parsed.cidrs, 'outbound': 'proxy'});
+    }
+    if (parsed.domains.isNotEmpty) {
+      routeRules.add({'domain_suffix': parsed.domains, 'outbound': 'proxy'});
+    }
+    routeFinal = 'direct'; // everything not listed stays on the local connection
+    dnsFinal = 'dns-direct'; // most traffic is direct → resolve locally
+  } else if (routeMode == 'exclude') {
+    if (parsed.cidrs.isNotEmpty) {
+      routeRules.add({'ip_cidr': parsed.cidrs, 'outbound': 'direct'});
+    }
+    if (parsed.domains.isNotEmpty) {
+      routeRules.add({'domain_suffix': parsed.domains, 'outbound': 'direct'});
+    }
+    routeFinal = 'proxy';
+    dnsFinal = 'dns-proxy';
+  } else {
+    routeFinal = 'proxy'; // 'all'
+    dnsFinal = 'dns-proxy';
+  }
 
   final cfg = {
     'log': {'level': 'info', 'timestamp': true},
@@ -197,7 +266,7 @@ String buildSingboxConfig(String vlessUrl, {String? caCertPath}) {
       'rules': [
         {'domain': [host], 'server': 'dns-direct'},
       ],
-      'final': 'dns-proxy',
+      'final': dnsFinal,
       'strategy': 'ipv4_only',
     },
     'inbounds': [
@@ -219,10 +288,8 @@ String buildSingboxConfig(String vlessUrl, {String? caCertPath}) {
       {'type': 'dns', 'tag': 'dns-out'},
     ],
     'route': {
-      'rules': [
-        {'protocol': 'dns', 'outbound': 'dns-out'},
-      ],
-      'final': 'proxy',
+      'rules': routeRules,
+      'final': routeFinal,
       'auto_detect_interface': true,
     },
   };
