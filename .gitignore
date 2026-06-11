@@ -6,13 +6,9 @@
 /sfa-ref/
 /build/
 /singbox-client.json
-/desktop/sing-box
 /desktop/socks-test.json
-/desktop/chessvpn-helper
-
-# Android tree is excluded from THIS repo: not needed for the Windows/Linux desktop
-# build, it carries the home-server config (a secret) and a 39 MB libbox.aar.
-app/android/
+# tracked (needed to build/run): /desktop/sing-box, /desktop/sing-box.exe,
+# /desktop/chessvpn-helper, app/android/ (secret-stripped) + libbox.aar.
 
 # Stale desktop core binaries committed as assets earlier (not referenced by pubspec).
 app/assets/bin/
