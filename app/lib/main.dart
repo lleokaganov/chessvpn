@@ -6,7 +6,30 @@ import 'desktop_vpn.dart';
 import 'settings_page.dart';
 import 'vpn_config.dart';
 
-void main() => runApp(const ChessApp());
+// Held for the whole process lifetime so the OS keeps the single-instance lock; the
+// lock is released automatically when the process exits (even on a crash), so a stale
+// lock can never block a relaunch.
+RandomAccessFile? _instanceLock;
+
+void main() {
+  _ensureSingleInstance();
+  runApp(const ChessApp());
+}
+
+/// On desktop, refuse to start a second copy — two instances would each spawn the core
+/// and fight over the tun0 device. An exclusive advisory lock on a file in the runtime
+/// dir does it portably (Linux/Windows/macOS). Mobile already runs a single task.
+void _ensureSingleInstance() {
+  if (Platform.isAndroid || Platform.isIOS) return;
+  try {
+    final dir = Platform.environment['XDG_RUNTIME_DIR'] ?? Directory.systemTemp.path;
+    _instanceLock = File('$dir${Platform.pathSeparator}chessvpn.lock')
+        .openSync(mode: FileMode.write);
+    _instanceLock!.lockSync(FileLock.exclusive); // throws if another instance holds it
+  } on FileSystemException {
+    exit(0); // already running — bow out quietly
+  }
+}
 
 class ChessApp extends StatelessWidget {
   const ChessApp({super.key});

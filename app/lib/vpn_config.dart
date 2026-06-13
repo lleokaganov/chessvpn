@@ -408,6 +408,10 @@ String buildSingboxConfig(String vlessUrl,
         'tag': 'tun-in',
         'interface_name': 'tun0',
         'inet4_address': '172.19.0.1/30',
+        // Also claim an IPv6 range so IPv6 traffic is pulled INTO the tunnel instead of
+        // leaking past it on dual-stack networks (real-IP exposure / unexpected
+        // censorship). With strict_route this is fail-closed: captured, never bypassed.
+        'inet6_address': 'fdfe:dcba:9876::1/126',
         'mtu': 1500,
         'auto_route': true,
         'strict_route': true,

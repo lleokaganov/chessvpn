@@ -52,14 +52,20 @@ class TunnelService : VpnService(), PlatformInterface {
     private var defaultListener: InterfaceUpdateListener? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
+        // A null intent means Android auto-restarted us after killing the process (low
+        // memory). We must NOT silently resume: the original profile config is gone, so
+        // we'd come up on the empty placeholder config — a tunnel-LESS service that would
+        // still report "connected" while traffic flows in the CLEAR. That fail-open leak
+        // is the worst outcome for a censorship tool, so stay DOWN (fail-closed) instead
+        // and let the user re-arm. START_NOT_STICKY also stops Android from doing this.
+        if (intent == null || intent.action == ACTION_STOP) {
             stopTunnel()
             return START_NOT_STICKY
         }
-        configOverride = intent?.getStringExtra("config")
+        configOverride = intent.getStringExtra("config")
         startForegroundInnocuous()
         Thread { startTunnel() }.start()
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     private fun startTunnel() {
@@ -153,6 +159,10 @@ class TunnelService : VpnService(), PlatformInterface {
             val r6 = options.inet6RouteAddress
             if (r6.hasNext()) {
                 while (r6.hasNext()) { val p = r6.next(); b.addRoute(p.address(), p.prefix()) }
+            } else {
+                // Mirror the IPv4 default-route fallback: capture ALL IPv6 too, so it
+                // can't leak past the tunnel on dual-stack networks (fail-closed).
+                b.addRoute("::", 0)
             }
             try {
                 val dns = options.dnsServerAddress

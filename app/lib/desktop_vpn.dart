@@ -4,15 +4,22 @@ import 'dart:io';
 
 /// Desktop (Linux/Windows) VPN controller — runs the sing-box core in TUN mode.
 ///
-/// Linux: a one-time-installed privileged helper (`/usr/local/bin/chessvpn-helper`)
-/// is whitelisted in sudoers NOPASSWD, so connect/disconnect need **no password**.
+/// Linux: the core binary carries file capabilities `cap_net_admin,cap_net_raw+ep`
+/// (granted ONCE at install via `scripts/install-linux.sh`). That lets it create the
+/// TUN device and program routes **as the normal, unprivileged user** — so there is no
+/// root, no sudo, no setuid helper, and no password at connect time. Running an
+/// attacker-supplied config can therefore never escalate to root: a capability is not
+/// root (it can touch the network, not `/etc/shadow`). This replaced the old NOPASSWD
+/// `chessvpn-helper`, which was a local-privilege-escalation hole (any local process
+/// could run an arbitrary sing-box config as root).
 ///
 /// Windows: sing-box.exe + wintun.dll ship next to the app .exe. Connecting launches
 /// an elevated watcher (single UAC prompt) that runs sing-box until a flag file is
 /// removed; disconnecting just deletes that flag file, so turning the tunnel OFF needs
 /// no second prompt. Output is mirrored to a log file we tail to detect "connected".
 class DesktopVpn {
-  static const helper = '/usr/local/bin/chessvpn-helper';
+  // Core installed at a fixed root-owned path; install-linux.sh setcaps it here.
+  static const _coreLinux = '/usr/local/lib/chessvpn/sing-box';
   Process? _proc;
   Timer? _logPoll;
   String _lastStatus = 'disconnected';
@@ -34,8 +41,8 @@ class DesktopVpn {
     if (Platform.isWindows) {
       await _connectWindows();
     } else {
-      // passwordless via the installed helper
-      _proc = await Process.start('sudo', ['-n', helper, 'start', _cfg]);
+      // Run the capability-bearing core directly as the user — no sudo, no password.
+      _proc = await Process.start(_coreLinux, ['run', '-c', _cfg]);
       _proc!.stdout.transform(const SystemEncoding().decoder).listen(_parse);
       _proc!.stderr.transform(const SystemEncoding().decoder).listen(_parse);
       _proc!.exitCode.then((code) {
@@ -126,10 +133,11 @@ if (-not \$p.HasExited) { Stop-Process -Id \$p.Id -Force }
     if (chunk.contains('sing-box started')) {
       _lastStatus = 'connected';
       onStatus?.call('connected');
-    } else if (chunk.contains('a password is required') ||
-        chunk.contains('sudo:') ||
-        chunk.contains('FATAL') ||
-        chunk.contains('command not found')) {
+    } else if (chunk.contains('operation not permitted') ||
+        chunk.contains('permission denied')) {
+      // The core lacks cap_net_admin — installer wasn't run (or an update wiped caps).
+      onStatus?.call('error');
+    } else if (chunk.contains('FATAL') || chunk.contains('command not found')) {
       onStatus?.call('error');
     }
   }
@@ -143,9 +151,7 @@ if (-not \$p.HasExited) { Stop-Process -Id \$p.Id -Force }
         if (f.existsSync()) f.deleteSync();
       } catch (_) {}
     } else {
-      try {
-        await Process.run('sudo', ['-n', helper, 'stop']);
-      } catch (_) {}
+      // Just terminate the core; it tears down its own TUN device on exit.
       _proc?.kill();
     }
     _lastStatus = 'disconnected';

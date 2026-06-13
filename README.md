@@ -57,9 +57,12 @@ flutter build windows --release
 ```
 cd app
 flutter build linux --release
-sudo ../scripts/install-linux.sh        # ставит ядро + хелпер + правило sudoers NOPASSWD
+sudo ../scripts/install-linux.sh        # выдаёт ядру cap_net_admin + polkit-правило на DNS
 ```
-TUN-режим требует root; хелпер в sudoers позволяет включать VPN без ввода пароля.
+TUN-режиму нужны только сетевые capability (`cap_net_admin,cap_net_raw`), а не root:
+установщик выдаёт их самому бинарю ядра, и приложение запускает его **под обычным
+пользователем** — без sudo, без пароля и без привилегированного хелпера (раньше тут был
+NOPASSWD-хелпер — это была дыра local-privilege-escalation, теперь убрана).
 Запуск: `build/linux/x64/release/bundle/twomove`.
 
 ### Android
