@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
@@ -103,10 +105,14 @@ class VpnStore {
     // networks. Android/iOS use the platform store via the native tunnel, which is fine.
     final caPath =
         (Platform.isAndroid || Platform.isIOS) ? null : await _ensureCaBundle();
+    // Resolve the server host up front (system DNS first, then classic resolvers) and
+    // bake the IP in — so a blocked/poisoned 8.8.8.8 can't keep the tunnel from rising.
+    final serverIp = await resolveServerIp(list[i].url);
     return buildSingboxConfig(list[i].url,
         caCertPath: caPath,
         routeMode: await routeMode(),
-        routeList: await routeList());
+        routeList: await routeList(),
+        serverIp: serverIp);
   }
 
   /// Public access to the bundled CA path (desktop only) — for the health-check probe.
@@ -130,9 +136,125 @@ class VpnStore {
   }
 }
 
+/// Classic public resolvers tried, in order, when the device's own DNS can't (or
+/// won't) resolve the server host — e.g. Russia throttling/hijacking plain DNS. Yandex
+/// (77.88.8.8) is included because it's the least likely to be blocked from inside RU.
+const _fallbackResolvers = ['8.8.8.8', '1.1.1.1', '9.9.9.9', '77.88.8.8'];
+
+/// Resolve a `vless://` server host to an IPv4 literal, preferring the device's own
+/// (system) DNS and falling back to classic public resolvers over plain UDP/53.
+/// Returns null only if every path fails (caller then lets sing-box try its own DNS).
+/// Baking the IP into the outbound removes the in-tunnel DNS bootstrap entirely, so a
+/// blocked 8.8.8.8 can't stop the connection from coming up.
+Future<String?> resolveServerIp(String vlessUrl) async {
+  String host;
+  try {
+    host = Uri.parse(vlessUrl.trim()).host;
+  } catch (_) {
+    return null;
+  }
+  if (host.isEmpty) return null;
+  // Already a literal IPv4 — nothing to resolve.
+  if (RegExp(r'^\d{1,3}(\.\d{1,3}){3}$').hasMatch(host)) return host;
+
+  // 1) System resolver (whatever the phone uses for normal browsing — works even when
+  //    8.8.8.8 is blocked, since the ISP's own resolver is reachable).
+  try {
+    final res = await InternetAddress.lookup(host, type: InternetAddressType.IPv4)
+        .timeout(const Duration(seconds: 3));
+    if (res.isNotEmpty) return res.first.address;
+  } catch (_) {/* fall through to classic resolvers */}
+
+  // 2) Classic public resolvers over plain UDP, in order.
+  for (final server in _fallbackResolvers) {
+    final ip = await _queryA(host, server);
+    if (ip != null) return ip;
+  }
+  return null;
+}
+
+/// Minimal DNS A-record query over UDP/53 to [server]. Returns the first A answer or
+/// null on timeout/error. Hand-rolled so it doesn't depend on the system resolver.
+Future<String?> _queryA(String name, String server,
+    {Duration timeout = const Duration(seconds: 2)}) async {
+  RawDatagramSocket? sock;
+  try {
+    sock = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+    final id = DateTime.now().microsecondsSinceEpoch & 0xFFFF;
+    final b = BytesBuilder();
+    b.add([(id >> 8) & 0xFF, id & 0xFF, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
+    for (final label in name.split('.')) {
+      final bytes = utf8.encode(label);
+      b.addByte(bytes.length);
+      b.add(bytes);
+    }
+    b.addByte(0); // root label
+    b.add([0, 1, 0, 1]); // QTYPE=A, QCLASS=IN
+    final query = b.toBytes();
+
+    final completer = Completer<String?>();
+    final s = sock;
+    s.listen((ev) {
+      if (ev == RawSocketEvent.read) {
+        final dg = s.receive();
+        if (dg != null && !completer.isCompleted) {
+          completer.complete(_parseFirstA(dg.data));
+        }
+      }
+    });
+    s.send(query, InternetAddress(server), 53);
+    return await completer.future
+        .timeout(timeout, onTimeout: () => null);
+  } catch (_) {
+    return null;
+  } finally {
+    sock?.close();
+  }
+}
+
+/// Parse the first A record out of a raw DNS response. Handles name compression by
+/// stopping at a pointer (we never need to expand names, only skip them).
+String? _parseFirstA(Uint8List m) {
+  if (m.length < 12) return null;
+  final qd = (m[4] << 8) | m[5];
+  final an = (m[6] << 8) | m[7];
+  int p = 12;
+  for (int i = 0; i < qd; i++) {
+    p = _skipName(m, p);
+    p += 4; // QTYPE + QCLASS
+  }
+  for (int i = 0; i < an && p + 10 <= m.length; i++) {
+    p = _skipName(m, p);
+    if (p + 10 > m.length) return null;
+    final type = (m[p] << 8) | m[p + 1];
+    final rdlen = (m[p + 8] << 8) | m[p + 9];
+    final rdata = p + 10;
+    if (type == 1 && rdlen == 4 && rdata + 4 <= m.length) {
+      return '${m[rdata]}.${m[rdata + 1]}.${m[rdata + 2]}.${m[rdata + 3]}';
+    }
+    p = rdata + rdlen;
+  }
+  return null;
+}
+
+/// Advance past a DNS name (sequence of length-prefixed labels), stopping right after a
+/// compression pointer (0xC0) or the zero root label.
+int _skipName(Uint8List m, int p) {
+  while (p < m.length) {
+    final len = m[p];
+    if (len == 0) return p + 1;
+    if ((len & 0xC0) == 0xC0) return p + 2; // pointer terminates the name
+    p += 1 + len;
+  }
+  return p;
+}
+
 /// Build just the vless/reality outbound (tag "proxy") from a `vless://` share URL.
 /// Shared by the full tunnel config and the health-check probe. Throws on a bad URL.
-Map<String, dynamic> _vlessOutbound(String vlessUrl, {String? caCertPath}) {
+/// When [serverIp] is given, it replaces the dial target (server) while SNI/Host keep
+/// the original domain — so TLS/Reality camouflage is unchanged but no DNS is needed.
+Map<String, dynamic> _vlessOutbound(String vlessUrl,
+    {String? caCertPath, String? serverIp}) {
   final u = Uri.parse(vlessUrl.trim());
   if (u.scheme != 'vless') {
     throw const FormatException('Not a vless:// URL');
@@ -160,7 +282,9 @@ Map<String, dynamic> _vlessOutbound(String vlessUrl, {String? caCertPath}) {
   final outbound = <String, dynamic>{
     'type': 'vless',
     'tag': 'proxy',
-    'server': host,
+    // Dial the pre-resolved IP when we have one; SNI (server_name) and ws Host below
+    // still carry the domain, so camouflage and routing are unaffected.
+    'server': (serverIp != null && serverIp.isNotEmpty) ? serverIp : host,
     'server_port': port,
     'uuid': uuid,
     'flow': flow,
@@ -219,9 +343,14 @@ Map<String, dynamic> _vlessOutbound(String vlessUrl, {String? caCertPath}) {
 /// 'include' (only [routeList] entries via VPN, rest direct), or 'exclude' (all via
 /// VPN except [routeList]). [routeList] = newline-separated CIDRs/domains.
 String buildSingboxConfig(String vlessUrl,
-    {String? caCertPath, String routeMode = 'all', String routeList = ''}) {
-  final outbound = _vlessOutbound(vlessUrl, caCertPath: caCertPath);
-  final host = outbound['server'] as String;
+    {String? caCertPath,
+    String routeMode = 'all',
+    String routeList = '',
+    String? serverIp}) {
+  final outbound =
+      _vlessOutbound(vlessUrl, caCertPath: caCertPath, serverIp: serverIp);
+  // The host to feed the bootstrap DNS rule: the original domain (not the dialed IP).
+  final host = Uri.parse(vlessUrl.trim()).host;
 
   final parsed = _splitRouteList(routeList);
   // DNS always stays in front; cidr & domain get SEPARATE rules (single-rule fields
@@ -258,7 +387,11 @@ String buildSingboxConfig(String vlessUrl,
     'log': {'level': 'info', 'timestamp': true},
     'dns': {
       'servers': [
-        {'tag': 'dns-direct', 'address': '8.8.8.8', 'detour': 'direct'},
+        // The server host is normally pre-resolved in Dart (system DNS → classic
+        // resolvers, see resolveServerIp) and baked into the outbound as a literal IP,
+        // so this rarely runs. When it does, prefer the device's own resolver over a
+        // hardcoded 8.8.8.8 (which Russia may throttle/hijack).
+        {'tag': 'dns-direct', 'address': 'local', 'detour': 'direct'},
         // Plain DNS over the proxy (not DoH): one fewer TLS handshake that would
         // otherwise also lean on the (broken, on old Windows) OS trust store.
         {'tag': 'dns-proxy', 'address': '1.1.1.1', 'detour': 'proxy'},
@@ -332,14 +465,16 @@ Future<ProbeResult> probeProfile(VpnProfile p) async {
 
 /// A minimal sing-box config exposing the profile's outbound via a local HTTP proxy on
 /// [httpPort] — used to push real traffic through the tunnel during a health check.
-String buildProbeConfig(String vlessUrl, int httpPort, {String? caCertPath}) {
-  final outbound = _vlessOutbound(vlessUrl, caCertPath: caCertPath);
-  final host = outbound['server'] as String;
+String buildProbeConfig(String vlessUrl, int httpPort,
+    {String? caCertPath, String? serverIp}) {
+  final outbound =
+      _vlessOutbound(vlessUrl, caCertPath: caCertPath, serverIp: serverIp);
+  final host = Uri.parse(vlessUrl.trim()).host;
   final cfg = {
     'log': {'level': 'error'},
     'dns': {
       'servers': [
-        {'tag': 'd', 'address': '8.8.8.8', 'detour': 'direct'},
+        {'tag': 'd', 'address': 'local', 'detour': 'direct'},
         {'tag': 'p', 'address': '1.1.1.1', 'detour': 'proxy'},
       ],
       'rules': [
@@ -392,7 +527,9 @@ Future<ProbeResult> probeViaCore(VpnProfile p, String corePath,
   final cfgFile = File(
       '${Directory.systemTemp.path}${Platform.pathSeparator}chessvpn-probe-$port.json');
   try {
-    await cfgFile.writeAsString(buildProbeConfig(p.url, port, caCertPath: caCertPath));
+    final serverIp = await resolveServerIp(p.url);
+    await cfgFile.writeAsString(
+        buildProbeConfig(p.url, port, caCertPath: caCertPath, serverIp: serverIp));
     proc = await Process.start(corePath, ['run', '-c', cfgFile.path]);
     // give the http inbound a moment to come up
     await Future.delayed(const Duration(milliseconds: 1300));
