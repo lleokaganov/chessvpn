@@ -51,7 +51,13 @@ cd app
 flutter build windows --release
 ```
 Рядом с `chess.exe` положить `sing-box.exe` (ядро) и `wintun.dll`. Автосборка — в
-`.github/workflows/windows.yml` (GitHub Actions).
+`.github/workflows/windows.yml` (GitHub Actions): собирает и портативный zip, и
+**установщик** `chess-setup.exe` (Inno Setup, `desktop/chess-installer.iss`).
+
+> **Ставьте через установщик.** Он кладёт приложение в `Program Files` — папку, в
+> которую обычный пользователь писать не может. Портативный zip, распакованный в
+> `Downloads`/на рабочий стол, позволяет подложить рядом вредоносную `wintun.dll`,
+> которая выполнится с правами администратора (DLL-planting). Установщик это исключает.
 
 ### Linux
 ```

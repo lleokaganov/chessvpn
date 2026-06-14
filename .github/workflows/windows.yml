@@ -49,7 +49,7 @@ jobs:
           Write-Host "--- Release folder ---"
           Get-ChildItem $dst | Select-Object Name, Length
 
-      - name: Package zip
+      - name: Package zip (portable)
         working-directory: app
         shell: pwsh
         run: Compress-Archive -Path build\windows\x64\runner\Release\* -DestinationPath ..\chess-windows.zip -Force
@@ -58,4 +58,21 @@ jobs:
         with:
           name: chess-windows
           path: chess-windows.zip
+          retention-days: 30
+
+      - name: Build installer (Inno Setup -> Program Files)
+        working-directory: app
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          Copy-Item ..\desktop\chess-installer.iss .\chess-installer.iss
+          $ver = (Select-String -Path pubspec.yaml -Pattern '^version:\s*([0-9.]+)').Matches[0].Groups[1].Value
+          Write-Host "installer version: $ver"
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVer=$ver chess-installer.iss
+          Move-Item chess-setup.exe ..\chess-setup.exe -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chess-windows-setup
+          path: chess-setup.exe
           retention-days: 30
